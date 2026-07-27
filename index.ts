@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import { startServer } from "./lib/server.mjs";
 import { junieLogin, junieRefreshToken } from "./lib/oauth.mjs";
 import { buildProviderModels, cleanOldModelsJson } from "./lib/models.mjs";
-import { getProxyUrl, getProxyDiagnostics } from "./lib/proxy.mjs";
+import { getProxyDiagnostics } from "./lib/proxy.mjs";
 
 const require = createRequire(import.meta.url);
 const { version: PLUGIN_VERSION } = require("./package.json");

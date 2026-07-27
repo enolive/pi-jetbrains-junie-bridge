@@ -83,6 +83,45 @@ Found in `com/jetbrains/junie/activation/services/JBALogin.class`:
 | Scopes | `offline_access openid jb-authn-service` |
 | Callback ports | 62345-62364 |
 
+## Provider Routing (X-LLM-Model + path)
+
+Two independent things decide where a request goes: the `X-LLM-Model` header
+(from `LlmProvider`, mapped in `IngrazzioLLMAccessKt`) and the request path
+(`LLMAccess$Companion.defaultPathForRequest`). Both must match, or the gateway
+answers with an **empty 404** (as opposed to the textual
+`Model not found for tag: <id>`, which means the route was right but the model
+ID was wrong — a useful way to tell the two failure modes apart).
+
+| LlmProvider | `X-LLM-Model` | Path | Works with OAuth? |
+|-------------|---------------|------|-------------------|
+| Anthropic | `anthropic` | `/v1/messages` | yes |
+| OpenAI | `openai` | `/v1/responses` (or `/v1/chat/completions`) | yes |
+| XAI | `grok` | `/v1/responses` **only** | yes |
+| Google | `google` | `/v1beta1/projects/jetbrains-grazie/locations/global/publishers/google/models/<model>:generateContent` | yes |
+| LiteLLM | `internal-lite-llm` | — | no (empty 404) |
+| AliCloud | `alicloud` | `/compatible-mode/v1/chat/completions` | no (empty 404) |
+
+Notes:
+
+- **Grok** is *not* served on `/v1/chat/completions` — that combination returns
+  an empty 404. Only `/v1/responses` works, with the same OpenAI payload as the
+  GPT models. Streaming, function tools, reasoning summaries and image input all
+  work; `reasoning_effort: "none"` is rejected (`This model does not support
+  reasoning_effort value none`), so map Pi's "off" to `minimal`.
+- **Google** works despite the older claim in this file that it can't. The
+  earlier attempts failed because they used an OpenAI-shaped path; the real path
+  is the Vertex-style one above. The project segment defaults to
+  `jetbrains-grazie` (`googleGenerateContent$default`) — the format string lives
+  in the class's `BootstrapMethods` constant pool, so it needs `javap -v`, not
+  plain `javap -c`. Streaming (`:streamGenerateContent?alt=sse`),
+  `systemInstruction`, `functionDeclarations` and `thinkingConfig` all work.
+- **DeepSeek** (`deepseek-v4-flash`, the one entry in llm24.net's list that the
+  bridge does not support) routes via `LlmProvider.AliCloud`, and every
+  path/header combination tried returns an empty 404 — it looks gated to
+  internal or EAP licences rather than reachable with a subscription token. The
+  same is true for `kimi-k2.5` (Moonshot), which only appears in the JAR, not in
+  the published model list.
+
 ## API Base URL
 
 ```
@@ -191,6 +230,24 @@ The integer values represent `[maxOutputTokens, maxContextTokens]`. When only on
 | `openai-gpt-5-2` | null | 400,000 | |
 | `openai-gpt-5-2-*` | null | 400,000 | mini, codex, pro variants |
 
+### Grok and Gemini capabilities (v2530.1)
+
+| Model | maxOutput | maxContext | in/out $ per 1M |
+|-------|-----------|------------|-----------------|
+| `grok-4.3` | null | 1,000,000 | 1.25 / 2.5 |
+| `grok-4.5` | null | 500,000 | 2.0 / 6.0 |
+| `gemini-3-flash-preview` | null | 1,048,576 | 0.5 / 3.0 |
+| `gemini-3.1-pro-preview` | null | 1,048,576 | 2.0 / 12.0 |
+| `gemini-3.1-flash-lite` | null | 1,048,576 | 0.25 / 1.5 |
+| `gemini-3.5-flash-lite` | null | 1,048,576 | 0.25 / 1.5 |
+| `gemini-3.6-flash` | null | 1,048,576 | 1.5 / 7.5 |
+
+Careful when reading `ModelCapabilities` from the bytecode: the **last two ints**
+before the `DefaultConstructorMarker` are Kotlin's synthetic default-argument
+bitmasks (e.g. `59352`), not capability values. The Grok/Gemini entries also pass
+`null` for `LLMVision`, yet both accept image input in practice — verified with a
+real 32×32 PNG.
+
 ## Probing Models Without the JAR
 
 The Grazie backend usually serves a new model **before** it appears in the
@@ -214,7 +271,8 @@ The current list is also mirrored at https://llm24.net/llm/junie.txt.
 
 - `openai-*` models → forwarded via the OpenAI **Responses API** (`/v1/responses`), model ID mapped (e.g. `openai-gpt-5-4` → `gpt-5.4`). This lets reasoning effort be combined with function tools (see the Responses API section above).
 - `claude-*` models → forwarded as Anthropic messages, model ID passed through as-is
-- `google-*` models → **not supported** via OAuth; Grazie requires native protocol for these
+- `grok-*` models → same `/v1/responses` route as OpenAI but with `X-LLM-Model: grok`; ID mapped (`grok-4-5` → `grok-4.5`)
+- `gemini-*` models → Pi drives these with pi-ai's `google-generative-ai` API (the `@google/genai` SDK), pointed at the bridge's `/google/v1beta` baseUrl. `handleGoogle` rewrites `/google/v1beta/models/<id>:<method>` onto the Grazie Vertex path and passes body and response through unchanged. **Gemini IDs keep their dots** (`gemini-3.1-pro-preview`, not `gemini-3-1-…`): pi-ai decides between the Gemini 3 `thinkingLevel` API and the older `thinkingBudget` API by matching `/gemini-3(\.\d+)?-(pro|flash)/` against the model ID.
 
 ## Update Checklist
 
@@ -223,7 +281,7 @@ When updating to a new Junie CLI version:
 1. Download the new release ZIP or extract from npm package
 2. Extract the JAR and run the decompile commands above
 3. Compare model lists — add new models to `KNOWN_GRAZIE_MODELS` and `MODEL_METADATA` in `lib/models.mjs`
-4. For new OpenAI models, add the ID mapping to `OPENAI_MODEL_MAP` in `lib/server.mjs`
+4. For new OpenAI/Grok models, add the ID mapping to `OPENAI_MODEL_MAP` / `GROK_MODEL_MAP` in `lib/server.mjs` (Gemini IDs need no mapping — they are used verbatim)
 5. Update the `Grazie-Agent` version in `lib/server.mjs`
 6. Check if OAuth config or API endpoints changed (unlikely but worth verifying)
 7. Verify OpenAI models still use `api: "openai-responses"` and that `RESPONSES_ALLOWED` (in `lib/server.mjs`) still matches the upstream `CreateResponsePayload` schema
@@ -232,6 +290,7 @@ When updating to a new Junie CLI version:
 
 | Bridge update | Junie CLI version | Changes |
 |--------------|-------------------|---------|
+| 2026-07-28 | v2530.1 (nightly) | Added xAI (`grok-4-3`, `grok-4-5`) and Google (5 Gemini 3 models). Both were reachable all along with a plain subscription token — the blocker was routing, not auth: Grok needs `X-LLM-Model: grok` on `/v1/responses` (never `/v1/chat/completions`), Google needs the Vertex-style `generateContent` path. See *Provider Routing*. `deepseek-v4-flash` remains unreachable (AliCloud route returns empty 404s). |
 | 2026-07-27 | v2144.7 | Added `claude-opus-5`. It is served by the Grazie backend before it shows up in the IntelliJ/Junie model picker (same as the gpt-5.6 models were). Found via llm24.net, verified live (see *Probing Models Without the JAR*). |
 | 2026-07-14 | v2144.7 | Route OpenAI models through the OpenAI Responses API (`/v1/responses`) instead of `/v1/chat/completions`, so reasoning effort can be combined with function tools (fixes the `reasoning_effort ... not supported ... in /v1/chat/completions` error on gpt-5.6). OpenAI models now register with `api: "openai-responses"`, `reasoning: true`, and a `thinkingLevelMap`. Added `handleResponses`/`RESPONSES_ALLOWED` in `lib/server.mjs`. |
 | 2026-07-04 | v2144.7 | Added claude-sonnet-5, claude-opus-4-8, claude-fable-5, openai-gpt-5-5. Updated Grazie-Agent version from 888.219 to 2144.7. Fixed model capabilities: Claude 4.6+ models have 1M context / 128k output (was incorrectly 200k/16k). OpenAI 5.2/5.3 have 400k context, 5.4/5.5 have 1M (was all incorrectly ~1M). Removed unavailable models (5.1 series, sonnet-4-5, opus-4-5). |

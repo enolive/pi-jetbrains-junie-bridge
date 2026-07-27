@@ -22,9 +22,15 @@ Once authenticated, run `/model` to select a model provided by the junie bridge.
 
 ## Available Models
 
-Only OpenAI and Anthropic (Claude) models are supported. Google/Gemini models are **not supported** — the Grazie backend requires a native protocol for these and rejects the OAuth tokens used by this proxy.
+Anthropic (Claude), OpenAI, xAI (Grok) and Google (Gemini) models are supported.
 
-The reasoning effort is adjustable in Pi. OpenAI models are routed through the OpenAI **Responses API** (`/v1/responses`), which is the only OpenAI surface on the Grazie backend that accepts a reasoning effort together with function tools.
+The list below is mostly in sync with the models Junie itself offers, as published at <https://llm24.net/llm/junie.txt>. What's missing from it:
+
+- **`deepseek-v4-flash`** — not implemented yet. JetBrains routes DeepSeek through a different backend (AliCloud), and every path/header combination tried so far is rejected by the Grazie gateway for subscription OAuth tokens.
+- **Older OpenAI generations** (`gpt-5-2025-08-07`, `gpt-5.3-codex`) — reachable, but deliberately left out in favour of the current GPT-5 models.
+- **`gpt`, `grok`, `gemini-pro`, `gemini-flash`** — stale aliases in that list; the backend answers `Model not found` for them.
+
+The reasoning effort is adjustable in Pi. OpenAI and Grok models are routed through the OpenAI **Responses API** (`/v1/responses`), which is the only OpenAI surface on the Grazie backend that accepts a reasoning effort together with function tools. Gemini models are routed through the Vertex-style `generateContent` path that Junie itself uses.
 
 **Anthropic:**
 - `claude-sonnet-4-6`
@@ -42,6 +48,17 @@ The reasoning effort is adjustable in Pi. OpenAI models are routed through the O
 - `openai-gpt-5-6-luna`
 - `openai-gpt-5-6-terra`
 - `openai-gpt-5-6-sol`
+
+**xAI:**
+- `grok-4-3`
+- `grok-4-5`
+
+**Google:**
+- `gemini-3-flash-preview`
+- `gemini-3.1-pro-preview`
+- `gemini-3.1-flash-lite`
+- `gemini-3.5-flash-lite`
+- `gemini-3.6-flash`
 
 ## Proxy Support
 
@@ -75,6 +92,8 @@ The extension starts a local proxy server that translates between Pi and JetBrai
 
 - OpenAI models (`openai-gpt-*`) are forwarded via `/v1/responses` (OpenAI Responses API) so reasoning effort works together with tool calls
 - Anthropic models (`claude-*`) are forwarded via `/v1/messages`
+- Grok models (`grok-*`) use the same Responses API, with the routing header that Junie uses for xAI
+- Gemini models (`gemini-*`) are forwarded to the Vertex-style `generateContent` endpoint
 - The proxy runs on an ephemeral port and shuts down when Pi exits
 
 ## Disclaimer

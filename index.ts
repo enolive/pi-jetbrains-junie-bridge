@@ -33,6 +33,8 @@ export default async function (pi: ExtensionAPI) {
     models: [
       ...buildProviderModels("openai", port),
       ...buildProviderModels("claude", port),
+      ...buildProviderModels("grok", port),
+      ...buildProviderModels("gemini", port),
     ],
   });
 

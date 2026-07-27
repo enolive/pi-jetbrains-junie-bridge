@@ -260,8 +260,9 @@ Junie CLI release — just probe the backend directly with a stored OAuth token:
 - **What is `maxOutputTokens`?** Send an absurd `max_tokens` (e.g. `9999999`). The
   400 error names the real limit:
   `max_tokens: 9999999 > 128000, which is the maximum allowed number of output tokens for claude-opus-5`.
-- **What is `maxContextTokens`?** Not cheaply probeable — assume the value used by
-  the model's siblings and correct it once a new JAR is available.
+- **What is `maxContextTokens`?** Overshoot the assumed window by ~30% with filler
+  text. The 400 names the real limit, and the request is **not billed** (see
+  *Context Overflow Errors*). Costs only the upload (a few MB).
 
 Guessing sibling IDs (`claude-opus-5-1`, `claude-haiku-5`, …) is free: 404s are not
 billed, so a quick sweep reveals everything that is already live.
@@ -273,6 +274,45 @@ The current list is also mirrored at https://llm24.net/llm/junie.txt.
 - `claude-*` models → forwarded as Anthropic messages, model ID passed through as-is
 - `grok-*` models → same `/v1/responses` route as OpenAI but with `X-LLM-Model: grok`; ID mapped (`grok-4-5` → `grok-4.5`)
 - `gemini-*` models → Pi drives these with pi-ai's `google-generative-ai` API (the `@google/genai` SDK), pointed at the bridge's `/google/v1beta` baseUrl. `handleGoogle` rewrites `/google/v1beta/models/<id>:<method>` onto the Grazie Vertex path and passes body and response through unchanged. **Gemini IDs keep their dots** (`gemini-3.1-pro-preview`, not `gemini-3-1-…`): pi-ai decides between the Gemini 3 `thinkingLevel` API and the older `thinkingBudget` API by matching `/gemini-3(\.\d+)?-(pro|flash)/` against the model ID.
+
+## Context Overflow Errors
+
+Pi recovers from a blown context window by compacting the conversation and
+retrying, but only if it recognises the failure as an overflow. Detection is
+purely a regex match on the assistant message's `errorMessage`, against
+`OVERFLOW_PATTERNS` in [`packages/ai/src/utils/overflow.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/ai/src/utils/overflow.ts).
+
+**The bridge needs no special handling here.** Grazie is a pure passthrough for
+these errors: it returns the upstream provider's original error body, and the
+bridge forwards it verbatim in `error.message` (`sendJson(res, upstream.status, …)`
+in every handler in `lib/server.mjs`). So the message Pi sees still contains the
+native provider phrasing that Pi already knows.
+
+Verified 2026-07-28 against the live backend, all four families:
+
+| Model | HTTP | Upstream error message | Matching pi pattern |
+|---|---|---|---|
+| `openai-gpt-5-2` | 400 | `Your input exceeds the context window of this model.` (`code: context_length_exceeded`) | `/exceeds the context window/i` |
+| `grok-4-5` | 400 | `This model's maximum prompt length is 500000 but the request contains 700207 tokens.` | `/maximum prompt length is \d+/i` |
+| `claude-sonnet-4-6` | 400 | `prompt is too long: 1300025 tokens > 1000000 maximum` | `/prompt is too long/i` |
+| `gemini-3.5-flash-lite` | 400 | `The input token count exceeds the maximum number of tokens allowed 1048576.` | `/input token count.*exceeds the maximum/i` |
+
+None of them trip `NON_OVERFLOW_PATTERNS` (rate-limit / throttling exclusions).
+
+Two things worth remembering:
+
+- **Overflow requests are free.** The window is validated before inference, so the
+  400 costs 0 credits — confirmed by reading `/junie/balance` before and after all
+  four probes (balance unchanged to the cent). This makes overflow a cheap probing
+  tool, not something to avoid.
+- **The declared windows are exact.** The `contextWindow` values in `lib/models.mjs`
+  match what the backend enforces (500k Grok, 1M Claude, 1048576 Gemini).
+
+If a future model family *does* get wrapped in a Grazie-specific error envelope,
+the fix belongs in the extension, not the proxy: a `pi.on("message_end", …)`
+handler that rewrites `errorMessage` to start with `context_length_exceeded:`
+(the generic fallback pattern). See the *Context Overflow Errors* section of pi's
+`docs/custom-provider.md` for the exact shape.
 
 ## Update Checklist
 

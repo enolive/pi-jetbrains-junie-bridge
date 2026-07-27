@@ -19,18 +19,17 @@ Once authenticated, run `/model` to select a model provided by the junie bridge.
   ![Screnshot showcasing balance tracking](./docs/balance_tracking.png)
 - **`/junie` command** — check proxy status, balance, and available models from within Pi
   ![Screnshot showcasing the `junie` command](./docs/junie_command.png)
+- **Automatic context compaction** — when a conversation outgrows the model's context
+  window, Pi compacts it and retries instead of failing. This works out of the box for
+  all four model families: the bridge passes the backend's original overflow error
+  through unchanged, so Pi's built-in detection recognises it (verified live against
+  Claude, OpenAI, Grok and Gemini).
 
 ## Available Models
 
-Anthropic (Claude), OpenAI, xAI (Grok) and Google (Gemini) models are supported.
+Anthropic (Claude), OpenAI, xAI (Grok) and Google (Gemini) models are supported. The reasoning effort is adjustable in Pi.
 
-The list below is mostly in sync with the models Junie itself offers, as published at <https://llm24.net/llm/junie.txt>. What's missing from it:
-
-- **`deepseek-v4-flash`** — not implemented yet. JetBrains routes DeepSeek through a different backend (AliCloud), and every path/header combination tried so far is rejected by the Grazie gateway for subscription OAuth tokens.
-- **Older OpenAI generations** (`gpt-5-2025-08-07`, `gpt-5.3-codex`) — reachable, but deliberately left out in favour of the current GPT-5 models.
-- **`gpt`, `grok`, `gemini-pro`, `gemini-flash`** — stale aliases in that list; the backend answers `Model not found` for them.
-
-The reasoning effort is adjustable in Pi. OpenAI and Grok models are routed through the OpenAI **Responses API** (`/v1/responses`), which is the only OpenAI surface on the Grazie backend that accepts a reasoning effort together with function tools. Gemini models are routed through the Vertex-style `generateContent` path that Junie itself uses.
+The list below is mostly in sync with the models Junie itself offers, as published at <https://llm24.net/llm/junie.txt>.
 
 **Anthropic:**
 - `claude-sonnet-4-6`
@@ -59,6 +58,11 @@ The reasoning effort is adjustable in Pi. OpenAI and Grok models are routed thro
 - `gemini-3.1-flash-lite`
 - `gemini-3.5-flash-lite`
 - `gemini-3.6-flash`
+
+Missing models:
+- **`deepseek-v4-flash`** — not implemented yet. JetBrains routes DeepSeek through a different backend (AliCloud), and every path/header combination tried so far is rejected by the Grazie gateway for subscription OAuth tokens.
+- **Older OpenAI generations** (`gpt-5-2025-08-07`, `gpt-5.3-codex`) — reachable, but deliberately left out in favour of the current GPT-5 models.
+- **`gpt`, `grok`, `gemini-pro`, `gemini-flash`** — stale aliases in that list; the backend answers `Model not found` for them.
 
 ## Proxy Support
 

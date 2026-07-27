@@ -178,6 +178,7 @@ The integer values represent `[maxOutputTokens, maxContextTokens]`. When only on
 | `claude-sonnet-5` | 128,000 | 1,000,000 | |
 | `claude-sonnet-4-6` | 128,000 | 1,000,000 | |
 | `claude-opus-4-8` | 128,000 | 1,000,000 | |
+| `claude-opus-5` | 128,000 | 1,000,000 | maxOutput probed live; context assumed same as siblings |
 | `claude-opus-4-7` | 128,000 | 1,000,000 | |
 | `claude-opus-4-6` | 128,000 | 1,000,000 | |
 | `claude-fable-5` | 128,000 | 1,000,000 | |
@@ -189,6 +190,25 @@ The integer values represent `[maxOutputTokens, maxContextTokens]`. When only on
 | `openai-gpt-5-3-codex` | null | 400,000 | |
 | `openai-gpt-5-2` | null | 400,000 | |
 | `openai-gpt-5-2-*` | null | 400,000 | mini, codex, pro variants |
+
+## Probing Models Without the JAR
+
+The Grazie backend usually serves a new model **before** it appears in the
+IntelliJ/Junie model picker (this was true for the gpt-5.6 series and for
+`claude-opus-5`). So a model can be added to the bridge without waiting for a new
+Junie CLI release — just probe the backend directly with a stored OAuth token:
+
+- **Does the model exist?** `POST /v1/messages` with a one-token prompt. An unknown
+  ID returns `404 Model not found for tag: <id>`; a real one returns `200`.
+- **What is `maxOutputTokens`?** Send an absurd `max_tokens` (e.g. `9999999`). The
+  400 error names the real limit:
+  `max_tokens: 9999999 > 128000, which is the maximum allowed number of output tokens for claude-opus-5`.
+- **What is `maxContextTokens`?** Not cheaply probeable — assume the value used by
+  the model's siblings and correct it once a new JAR is available.
+
+Guessing sibling IDs (`claude-opus-5-1`, `claude-haiku-5`, …) is free: 404s are not
+billed, so a quick sweep reveals everything that is already live.
+The current list is also mirrored at https://llm24.net/llm/junie.txt.
 
 ## Model Routing
 
@@ -212,6 +232,7 @@ When updating to a new Junie CLI version:
 
 | Bridge update | Junie CLI version | Changes |
 |--------------|-------------------|---------|
+| 2026-07-27 | v2144.7 | Added `claude-opus-5`. It is served by the Grazie backend before it shows up in the IntelliJ/Junie model picker (same as the gpt-5.6 models were). Found via llm24.net, verified live (see *Probing Models Without the JAR*). |
 | 2026-07-14 | v2144.7 | Route OpenAI models through the OpenAI Responses API (`/v1/responses`) instead of `/v1/chat/completions`, so reasoning effort can be combined with function tools (fixes the `reasoning_effort ... not supported ... in /v1/chat/completions` error on gpt-5.6). OpenAI models now register with `api: "openai-responses"`, `reasoning: true`, and a `thinkingLevelMap`. Added `handleResponses`/`RESPONSES_ALLOWED` in `lib/server.mjs`. |
 | 2026-07-04 | v2144.7 | Added claude-sonnet-5, claude-opus-4-8, claude-fable-5, openai-gpt-5-5. Updated Grazie-Agent version from 888.219 to 2144.7. Fixed model capabilities: Claude 4.6+ models have 1M context / 128k output (was incorrectly 200k/16k). OpenAI 5.2/5.3 have 400k context, 5.4/5.5 have 1M (was all incorrectly ~1M). Removed unavailable models (5.1 series, sonnet-4-5, opus-4-5). |
 | Initial | v1468.30 | Original model list and configuration. |

@@ -24,9 +24,7 @@ Once authenticated, run `/model` to select a model provided by the junie bridge.
 
 Only OpenAI and Anthropic (Claude) models are supported. Google/Gemini models are **not supported** — the Grazie backend requires a native protocol for these and rejects the OAuth tokens used by this proxy.
 
-**Recommendation:** Use the Claude models — only Anthropic models send reasoning blocks (extended thinking) to Pi, which significantly improves coding output quality.
-
-For all models — Claude and OpenAI alike — the reasoning effort is adjustable in Pi (e.g. via `/model`). OpenAI models are routed through the OpenAI **Responses API** (`/v1/responses`), which is the only OpenAI surface on the Grazie backend that accepts a reasoning effort together with function tools.
+The reasoning effort is adjustable in Pi. OpenAI models are routed through the OpenAI **Responses API** (`/v1/responses`), which is the only OpenAI surface on the Grazie backend that accepts a reasoning effort together with function tools.
 
 **Anthropic:**
 - `claude-sonnet-4-6`
@@ -34,6 +32,7 @@ For all models — Claude and OpenAI alike — the reasoning effort is adjustabl
 - `claude-opus-4-6`
 - `claude-opus-4-7`
 - `claude-opus-4-8`
+- `claude-opus-5`
 - `claude-fable-5`
 
 **OpenAI:**

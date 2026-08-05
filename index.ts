@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { createRequire } from "node:module";
 import { startServer } from "./lib/server.mjs";
 import { junieLogin, junieRefreshToken } from "./lib/oauth.mjs";
@@ -7,6 +7,160 @@ import { getProxyDiagnostics } from "./lib/proxy.mjs";
 
 const require = createRequire(import.meta.url);
 const { version: PLUGIN_VERSION } = require("./package.json");
+
+/** A run of text with one style — styling is applied after wrapping, so that
+ *  the ANSI escapes never confuse the width arithmetic. */
+type Span = { text: string; color?: ThemeColor; bold?: boolean; italic?: boolean };
+
+function styleSpan({ text, color, bold, italic }: Span, theme: Theme): string {
+  let styled = text;
+  if (bold) styled = theme.bold(styled);
+  if (italic) styled = theme.italic(styled);
+  if (color) styled = theme.fg(color, styled);
+  return styled;
+}
+
+/** Word-wrap styled spans, keeping each word's style intact. */
+function wrapSpans(spans: Span[], width: number, indent: string, theme: Theme): string[] {
+  const words = spans.flatMap((span) =>
+    span.text.split(/\s+/).filter(Boolean).map((text) => ({ ...span, text })),
+  );
+
+  const lines: string[] = [];
+  let current: Span[] = [];
+  let length = 0;
+  const flush = (continuation: string) => {
+    if (current.length > 0) lines.push(continuation + current.map((s) => styleSpan(s, theme)).join(" "));
+    current = [];
+    length = 0;
+  };
+
+  for (const word of words) {
+    const added = length === 0 ? word.text.length : length + 1 + word.text.length;
+    if (length > 0 && added > width) flush(lines.length === 0 ? indent : `${indent}  `);
+    current.push(word);
+    length = length === 0 ? word.text.length : added;
+  }
+  flush(lines.length === 0 ? indent : `${indent}  `);
+
+  return lines.length > 0 ? lines : [""];
+}
+
+/**
+ * Colour a value word by word — never inside a word, so that "−$2.14" survives
+ * wrapping in one piece. Money is highlighted, and `backticks` mark a value
+ * worth picking out (the license type), which keeps the decision in the report
+ * text instead of teaching the renderer about content.
+ */
+function valueSpans(text: string, color: ThemeColor): Span[] {
+  return text
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => {
+      if (word.startsWith("`") && word.endsWith("`")) {
+        return { text: word.slice(1, -1), color: "warning" as ThemeColor, bold: true };
+      }
+      return { text: word.replaceAll("`", ""), color: /\$\d/.test(word) ? ("success" as ThemeColor) : color };
+    });
+}
+
+/**
+ * Escape, in every encoding a terminal may use for it.
+ *
+ * A bare "\x1b" only arrives in legacy mode. With the Kitty keyboard protocol
+ * (which iTerm2 negotiates) Escape is `CSI 27 u` — optionally carrying
+ * modifier and event-type fields — and xterm's modifyOtherKeys mode sends
+ * `CSI 27 ; <mod> ; 27 ~` instead. Matching only "\x1b" misses both.
+ * pi-tui's `matchesKey` handles all of this, but importing it is not an
+ * option (see showReport below).
+ */
+function isEscapeKey(data: string): boolean {
+  if (data === "\x1b") return true;
+
+  // CSI u: \x1b[<codepoint>[:alternates][;<mod>[:<event>]]u — 27 = Escape
+  const csiU = data.match(/^\x1b\[(\d+)(?::\d*)*(?:;\d+(?::\d+)?)?u$/);
+  if (csiU) return csiU[1] === "27";
+
+  // modifyOtherKeys: \x1b[27;<mod>;<codepoint>~
+  return /^\x1b\[27;\d+;27~$/.test(data);
+}
+
+// Arrow keys with optional CSI parameters (the Kitty protocol adds modifier and
+// event fields), plus the vi-style aliases and space.
+const SCROLL_KEY_RE = /\x1b\[([\d;:]*)([AB])|([kj ])/g;
+
+/**
+ * Lines to scroll for an input chunk: negative is up, 0 means "not a scroll key".
+ *
+ * Holding a key down repeats it faster than the TUI hands over chunks, so one
+ * chunk can carry several presses — counting them all keeps a held arrow
+ * scrolling smoothly instead of moving a single line per chunk.
+ */
+function scrollStep(data: string): number {
+  let step = 0;
+  SCROLL_KEY_RE.lastIndex = 0;
+  for (let m = SCROLL_KEY_RE.exec(data); m; m = SCROLL_KEY_RE.exec(data)) {
+    // Kitty key-release events (event type 3) would otherwise count twice.
+    if (m[1] && m[1].endsWith(":3")) continue;
+    switch (m[2] ?? m[3]) {
+      case "A":
+      case "k":
+        step -= 1;
+        break;
+      case "B":
+      case "j":
+        step += 1;
+        break;
+      case " ":
+        step += 10;
+        break;
+    }
+  }
+  return step;
+}
+
+/**
+ * Render one line of the report's markdown subset — `**Label:** value`,
+ * whole-line `*italics*` for hints, `- ` bullets and `` `code` `` — giving
+ * labels, values and amounts distinct colours.
+ */
+function renderReportLine(raw: string, width: number, theme: Theme): string[] {
+  const plain = raw;
+  if (!plain.trim()) return [""];
+
+  const indent = plain.startsWith("- ") ? "   " : " ";
+  const available = width - indent.length - 2;
+
+  // Hint text: "*…*"
+  if (/^\*[^*].*\*$/.test(plain)) {
+    return wrapSpans([{ text: plain.slice(1, -1), color: "dim", italic: true }], available, indent, theme);
+  }
+
+  // Bullet: "- Tariff: $50.31 of $70.00" or a plain item like "- claude-opus-5"
+  if (plain.startsWith("- ")) {
+    const [, key, rest] = plain.slice(2).match(/^([^:]+:)?\s*(.*)$/s) ?? [];
+    const spans: Span[] = [{ text: "-", color: "dim" }];
+    if (key) spans.push({ text: key, color: "muted" });
+    // A bullet without a label carries the content itself, so it stays readable
+    spans.push(...valueSpans(rest ?? "", key ? "muted" : "text"));
+    return wrapSpans(spans, available, indent, theme);
+  }
+
+  // Heading with a label: "**Balance:** $5.00 remaining"
+  const labelled = plain.match(/^\*\*(.+?)\*\*\s*(.*)$/s);
+  if (labelled) {
+    const [, label, rest] = labelled;
+    return wrapSpans(
+      [{ text: label, color: "accent", bold: true }, ...valueSpans(rest, "muted")],
+      available,
+      indent,
+      theme,
+    );
+  }
+
+  // Plain body text (the model list) — full contrast, it is meant to be read
+  return wrapSpans(valueSpans(plain, "text"), available, indent, theme);
+}
 
 export default async function (pi: ExtensionAPI) {
   // Clean stale provider entries from ~/.pi/agent/models.json (left by old pi-junie setup)
@@ -52,6 +206,20 @@ export default async function (pi: ExtensionAPI) {
     return `$${value.toFixed(2)}`;
   }
 
+  function formatDate(ms: number | undefined): string | undefined {
+    if (typeof ms !== "number" || !Number.isFinite(ms)) return undefined;
+    return new Date(ms).toISOString().slice(0, 10);
+  }
+
+  /** Grazie reports credits; /auth/test reports plain USD for some licence types. */
+  function makeAmountFormatter(balanceUnit: unknown) {
+    const isCredits = balanceUnit === "CREDITS";
+    return (value: number | undefined): string | undefined =>
+      typeof value === "number" && Number.isFinite(value)
+        ? formatDollars(isCredits ? creditsToUsd(value) : value)
+        : undefined;
+  }
+
   pi.on("turn_end", async (_event, ctx) => {
     try {
       const res = await fetch(`http://localhost:${port}/junie/balance`);
@@ -61,9 +229,9 @@ export default async function (pi: ExtensionAPI) {
       startBalance ??= balanceLeft;
       const used = startBalance - balanceLeft;
 
-      const isCredits = balanceUnit === "CREDITS";
-      const leftDisplay = isCredits ? formatDollars(creditsToUsd(balanceLeft)) : formatDollars(balanceLeft);
-      const usedDisplay = isCredits ? formatDollars(creditsToUsd(used)) : formatDollars(used);
+      const money = makeAmountFormatter(balanceUnit);
+      const leftDisplay = money(balanceLeft);
+      const usedDisplay = money(used);
 
       ctx.ui.setStatus(
         "junie",
@@ -74,6 +242,62 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
+  /**
+   * Show a report without putting it into the conversation.
+   *
+   * pi.sendMessage() would be simpler, but every custom message is converted
+   * into a user message for the LLM (convertToLlm in pi's core/messages) — the
+   * `display` flag only controls TUI rendering. A status dump has no business
+   * in the context window, so it goes into a dismissible overlay instead.
+   * Without a TUI (RPC/print mode) there is nothing to show it in, so the
+   * message is the fallback rather than losing the output entirely.
+   */
+  async function showReport(ctx: ExtensionCommandContext, markdown: string) {
+    if (!ctx.hasUI) {
+      pi.sendMessage({ customType: "junie-status", content: markdown, display: true });
+      return;
+    }
+
+    // Rendered by hand rather than with pi-tui's Markdown component: pi-tui
+    // lives in pi's own nested node_modules and is not resolvable from an
+    // installed extension, so importing it would break at runtime.
+    await ctx.ui.custom((tui, theme, _keybindings, done) => {
+      // The TUI does not clip a component to the terminal — anything too tall
+      // just pushes the conversation off-screen. So the report scrolls itself.
+      let offset = 0;
+
+      return {
+        render(width: number) {
+          const inner = Math.max(20, width - 2);
+          const body = markdown.split("\n").flatMap((raw) => renderReportLine(raw, inner, theme));
+
+          const viewport = Math.max(5, (process.stdout.rows ?? 24) - 10);
+          const maxOffset = Math.max(0, body.length - viewport);
+          offset = Math.min(offset, maxOffset);
+
+          const rule = theme.fg("accent", "─".repeat(width));
+          const hint = maxOffset > 0
+            ? ` ↑/↓ to scroll (${offset + 1}-${Math.min(offset + viewport, body.length)} of ${body.length}) · Esc to close`
+            : " Press Esc to close";
+
+          return [rule, ...body.slice(offset, offset + viewport), theme.fg("dim", hint), rule];
+        },
+        invalidate() {},
+        handleInput(data: string) {
+          if (isEscapeKey(data)) {
+            done(undefined);
+            return;
+          }
+          const step = scrollStep(data);
+          if (step !== 0) {
+            offset = Math.max(0, offset + step);
+            tui.requestRender();
+          }
+        },
+      };
+    });
+  }
+
   // /junie command for debugging and status
   pi.registerCommand("junie", {
     description: "Show Junie proxy status, balance, and connectivity info",
@@ -82,16 +306,25 @@ export default async function (pi: ExtensionAPI) {
         const apiKey = await ctx.modelRegistry.getApiKeyForProvider("junie");
         const balanceHeaders: Record<string, string> = {};
         if (apiKey) balanceHeaders["Authorization"] = `Bearer ${apiKey}`;
-        const balanceRes = await fetch(`http://localhost:${port}/junie/balance`, { headers: balanceHeaders });
-        const balanceInfo = balanceRes.ok ? await balanceRes.json() : null;
 
-        const modelsRes = await fetch(`http://localhost:${port}/v1/models`);
+        // The balance round-trip dominates the command's latency, so everything
+        // it doesn't depend on is fetched alongside it rather than after it.
+        const wantsConnTest = args?.trim() === "test" || getProxyDiagnostics().proxy != null;
+        const [balanceRes, modelsRes, testRes] = await Promise.all([
+          fetch(`http://localhost:${port}/junie/balance`, { headers: balanceHeaders }),
+          fetch(`http://localhost:${port}/v1/models`),
+          wantsConnTest ? fetch(`http://localhost:${port}/junie/test`) : undefined,
+        ]);
+
+        // Read the body either way — on failure it carries the reason
+        const balanceInfo = await balanceRes.json().catch(() => null);
         const modelsInfo = modelsRes.ok ? await modelsRes.json() : null;
+        const testInfo = testRes?.ok ? await testRes.json().catch(() => null) : null;
 
         const diag = getProxyDiagnostics();
 
         const lines = [
-          `**Junie Bridge** v${PLUGIN_VERSION} — proxy on port ${port}`,
+          `**Junie Bridge** ${PLUGIN_VERSION} — running on port ${port}`,
           `**HTTP Proxy:** ${diag.proxy ?? "none (direct connection)"}`,
         ];
         if (diag.proxy) {
@@ -100,22 +333,45 @@ export default async function (pi: ExtensionAPI) {
         lines.push("");
 
         if (balanceInfo?.balanceLeft != null) {
-          const isCredits = balanceInfo.balanceUnit === "CREDITS";
-          const left = isCredits ? creditsToUsd(balanceInfo.balanceLeft) : balanceInfo.balanceLeft;
-          lines.push(`**Balance:** ${formatDollars(left)} remaining`);
+          const money = makeAmountFormatter(balanceInfo.balanceUnit);
+          lines.push(`**Balance:** ${money(balanceInfo.balanceLeft)} remaining`);
+
+          // Detailed split — only present when the Grazie QuotaAPI answered
+          const quota = balanceInfo.quota;
+          if (quota?.tariff) {
+            const refill = formatDate(quota.refill?.next);
+            lines.push(
+              `- Tariff: ${money(quota.tariff.available)} of ${money(quota.tariff.maximum)}` +
+                (refill ? ` · refills ${refill}` : ""),
+            );
+          }
+          if (quota?.topUp?.maximum) {
+            lines.push(`- Top-up: ${money(quota.topUp.available)} of ${money(quota.topUp.maximum)}`);
+          }
+
           if (startBalance != null) {
-            const used = startBalance - balanceInfo.balanceLeft;
-            const usedUsd = isCredits ? creditsToUsd(used) : used;
-            lines.push(`**Session usage:** −${formatDollars(usedUsd)}`);
+            lines.push(`**Session usage:** −${money(startBalance - balanceInfo.balanceLeft)}`);
+          }
+
+          if (balanceInfo.licenseType) {
+            lines.push("");
+            lines.push(`**License type:** \`${balanceInfo.licenseType}\``);
+            const until = formatDate(quota?.until);
+            if (until) lines.push(`- Valid until ${until}`);
+            if (balanceInfo.licenseType === "TRIAL") {
+              lines.push(
+                "*Unexpected license type? Junie may hand out free trial credits on top of your paid subscription." +
+                  " Once your free credits are spent your paid quota should display.*",
+              );
+            }
           }
         } else {
-          lines.push("**Balance:** unavailable (not authenticated — run /login)");
+          const reason = balanceInfo?.error?.message ?? "no response from the proxy";
+          lines.push(`**Balance:** unavailable — ${reason}`);
+          lines.push("*If this persists, run /login to re-authenticate.*");
         }
 
-        // Run connectivity test if requested or if proxy is configured
-        if (args?.trim() === "test" || diag.proxy) {
-          const testRes = await fetch(`http://localhost:${port}/junie/test`);
-          const testInfo = await testRes.json();
+        if (testInfo) {
           lines.push("");
           lines.push("**Connectivity:**");
           for (const [name, t] of Object.entries(testInfo.tests) as [string, any][]) {
@@ -128,21 +384,13 @@ export default async function (pi: ExtensionAPI) {
           lines.push("");
           lines.push(`**Models** (${modelsInfo.data.length}):`);
           for (const m of modelsInfo.data) {
-            lines.push(`- \`${m.id}\``);
+            lines.push(`- ${m.id}`);
           }
         }
 
-        pi.sendMessage({
-          customType: "junie-status",
-          content: lines.join("\n"),
-          display: "assistant",
-        });
+        await showReport(ctx, lines.join("\n"));
       } catch (e) {
-        pi.sendMessage({
-          customType: "junie-status",
-          content: `Junie proxy error: ${e instanceof Error ? e.message : String(e)}`,
-          display: "assistant",
-        });
+        await showReport(ctx, `Junie proxy error: ${e instanceof Error ? e.message : String(e)}`);
       }
     },
   });

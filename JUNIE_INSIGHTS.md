@@ -137,6 +137,114 @@ Routes:
 The full route list is defined in `LLMAccess$Companion` (and, with the `/v5/llm/<provider>/...` prefix, in `DirectProxyLLMAccess`):
 `/v1/audio/transcriptions`, `/v1/chat/completions`, `/v1/messages`, `/v1/responses`.
 
+## Quota / Balance API
+
+`/auth/test` (used by the bridge for the status line) returns a single number:
+
+```json
+{"balanceLeft": 5030563.2205, "balanceUnit": "CREDITS", "licenseType": "AIPU", "active": true}
+```
+
+`licenseType` is worth showing — a fresh subscription can start on `TRIAL`
+credits and only switch to `AIP`/`AIPU` once those are used up, which looks like
+a balance reset (see issue #1).
+
+IntelliJ/Junie-in-IDE shows *more* than that, and it does so through a different
+API: Grazie's **QuotaAPI**, not `/auth/test`. The relevant classes:
+
+| What | Where |
+|---|---|
+| API definitions (paths) | `ai/grazie/api/gateway/api/QuotaAPI.class` in `ml-llm/lib/modules/intellij.ml.llm.libraries.grazie.cloud.jar` |
+| Client | `ai/grazie/api/gateway/client/api/QuotaAPIClient.class` (same jar) |
+| Response models | `ai/grazie/quota/Quota.class`, `QuotaDetails`, `QuotaRefill`, `QuotaTariff` in `ej/lib/model-quota-jvm-*.jar` |
+| Caller | `JunieGrazieLLMProxy` → `GrazieQuotaState` → `QuotaUtilsKt` → `GrazieQuotaInfoProvider` (all in `ej/lib/ej-*.jar`) |
+
+**The endpoints are reachable with the bridge's existing bearer token, on the
+same host** (`ingrazzio-cloud-prod.labs.jb.gg`), under the `/user/v5` prefix —
+all `POST` with an empty `{}` body:
+
+| Path | Returns |
+|---|---|
+| `/user/v5/quota/get` | balance split into `tariffQuota` / `topUpQuota` |
+| `/user/v5/quota/metadata/refill` | `next` / `last` refill timestamp + tariff |
+| `/user/v5/quota/metadata/tariff` | tariff amount + period |
+| `/user/v5/quota/metadata/extensions` | extra granted credits with expiry |
+
+```json
+// POST /user/v5/quota/get
+{"current":{
+  "license":"…","current":{"amount":"1969436.7795"},"maximum":{"amount":"12000000.0"},
+  "until":1811019600000,
+  "tariffQuota":{"current":"1969436.7795","maximum":"7000000.0","available":"5030563.2205"},
+  "topUpQuota" :{"current":"0.0",         "maximum":"5000000.0","available":"0.0"}}}
+```
+
+Things that are easy to get wrong here:
+
+- **`current` is the amount *spent*, not the amount left.** `available` is what
+  remains (`available = maximum − current`).
+- Amounts are `Credit` objects (`{"amount": "…"}`) and are **credits**, not
+  dollars: `Credit.CREDITS_IN_DOLLAR = 100000` (in `ej/lib/utils-common-jvm-*.jar`),
+  which is where the bridge's `CREDITS_PER_USD` comes from.
+- `balanceLeft` from `/auth/test` equals `tariffQuota.available` (verified on an
+  AIPU licence with zero top-ups). The bridge therefore prefers the QuotaAPI's
+  `tariff.available + topUp.available` and only falls back to `balanceLeft`.
+- `licenseType` exists **only** on `/auth/test`, so both calls are needed.
+- **Accounts without an active licence have no quota at all**: `/auth/test` reports
+  `{"balanceLeft": 5.0, "balanceUnit": "USD", "licenseType": "TRIAL"}` (note the unit
+  is `USD`, not `CREDITS`) and every `/user/v5/quota/…` call answers `400` with an
+  empty body. The quota calls are therefore best-effort — the balance must keep
+  working without them.
+- The three calls are independent, so they are issued concurrently; done
+  sequentially they add up to ~2s and make `/junie` feel slow.
+
+The other route to the same data is `https://api.jetbrains.ai` — that is what
+the IDE itself uses, but it needs a Grazie JWT (`Grazie-Authenticate-JWT`)
+obtained by exchanging the JBA token via
+`POST /auth/jcp/provide-access/context-principal` (or `…/global-access-token`,
+both requiring a `licenseId`). The ingrazzio route above avoids that exchange
+entirely, so the bridge uses it.
+
+## Keeping `/junie` Out of the Context Window
+
+`pi.sendMessage()` is *not* UI-only: `convertToLlm` (pi's `core/messages`) turns
+every `role: "custom"` message into a `user` message for the LLM, and the
+`display` flag only decides whether the TUI renders it. Status output sent that
+way ends up in the context window.
+
+The `/junie` report therefore goes through `ctx.ui.custom()` (a dismissible
+component, same idea as pi's own `summarize.ts` example) and only falls back to
+`pi.sendMessage()` when `ctx.hasUI` is false (RPC/print mode), where an overlay
+cannot be shown.
+
+Two constraints shaped the implementation:
+
+- **Do not import `@earendil-works/pi-tui`.** Its `Markdown`/`Text`/`Container`
+  components would be the obvious choice, but the package sits in pi's *nested*
+  `node_modules` and is not resolvable from an installed extension. The overlay
+  therefore renders plain strings itself (`renderReportLine` in `index.ts`) —
+  `Component` only requires `render(width): string[]` and `invalidate()`.
+- **The TUI does not clip a component to the terminal height.** A component
+  taller than the screen simply pushes the conversation out of view; there is no
+  built-in scrolling. The overlay therefore scrolls itself: it keeps an offset,
+  renders only `process.stdout.rows - 10` lines of the report, and redraws via
+  `tui.requestRender()` on ↑/↓, j/k and space.
+- **A held key arrives batched.** Key repeats come in faster than the TUI hands
+  over chunks, so one `handleInput` call can carry several presses. `scrollStep`
+  therefore sums every scroll key found in the chunk instead of matching the
+  whole string — otherwise holding ↑ crawls one line per chunk. Kitty key-*release*
+  events (event type 3) are skipped so they do not count a second time.
+
+The renderer styles per word (labels `accent`+bold, `$` amounts `success`,
+backticked values `warning`, hints dim italic), applying colours *after*
+wrapping so ANSI escapes never enter the width arithmetic.
+
+Closing the overlay (Esc) needs more than `data === "\x1b"`: with the Kitty keyboard
+protocol (iTerm2 negotiates it) Escape arrives as `CSI 27 u`, optionally with
+modifier and event-type fields, and xterm's modifyOtherKeys mode sends
+`CSI 27 ; <mod> ; 27 ~`. See `isCloseKey` in `index.ts`; the canonical logic is
+`matchesKey` in pi-tui's `keys.js`.
+
 ## OpenAI: Responses API vs Chat Completions (reasoning effort)
 
 The Grazie backend rejects `reasoning_effort` on `/v1/chat/completions` for the newer

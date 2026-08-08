@@ -1,4 +1,10 @@
-import type { ExtensionAPI, ExtensionCommandContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+  ExtensionContext,
+  Theme,
+  ThemeColor,
+} from "@earendil-works/pi-coding-agent";
 import { createRequire } from "node:module";
 import { startServer } from "./lib/server.mjs";
 import { junieLogin, junieRefreshToken } from "./lib/oauth.mjs";
@@ -72,7 +78,7 @@ function valueSpans(text: string, color: ThemeColor): Span[] {
  * modifier and event-type fields — and xterm's modifyOtherKeys mode sends
  * `CSI 27 ; <mod> ; 27 ~` instead. Matching only "\x1b" misses both.
  * pi-tui's `matchesKey` handles all of this, but importing it is not an
- * option (see showReport below).
+ * option (see showOverlay below).
  */
 function isEscapeKey(data: string): boolean {
   if (data === "\x1b") return true;
@@ -220,9 +226,25 @@ export default async function (pi: ExtensionAPI) {
         : undefined;
   }
 
-  pi.on("turn_end", async (_event, ctx) => {
+  /** The status line only makes sense while a Junie model is doing the work. */
+  function isJunieModel(model: { provider?: string } | undefined): boolean {
+    return model?.provider === "junie";
+  }
+
+  // model_select fires alongside session_start on startup, so the two would
+  // otherwise ask the backend for the same balance twice.
+  let refreshing = false;
+
+  async function refreshStatus(ctx: ExtensionContext) {
+    if (refreshing) return;
+    refreshing = true;
     try {
-      const res = await fetch(`http://localhost:${port}/junie/balance`);
+      // The proxy can reuse the auth header of the last chat request, but
+      // before the first turn there is none — so resolve the key like /junie.
+      const apiKey = await ctx.modelRegistry.getApiKeyForProvider("junie");
+      const res = await fetch(`http://localhost:${port}/junie/balance`, {
+        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+      });
       if (!res.ok) return;
       const { balanceLeft, balanceUnit } = await res.json();
       if (typeof balanceLeft !== "number") return;
@@ -239,29 +261,72 @@ export default async function (pi: ExtensionAPI) {
       );
     } catch {
       // best-effort — don't spam errors for a status line
+    } finally {
+      refreshing = false;
     }
+  }
+
+  /** A status set with setStatus() is sticky, so leaving Junie has to clear it. */
+  function clearStatus(ctx: ExtensionContext) {
+    ctx.ui.setStatus("junie", undefined);
+  }
+
+  async function syncStatus(ctx: ExtensionContext, model = ctx.model) {
+    if (isJunieModel(model)) await refreshStatus(ctx);
+    else clearStatus(ctx);
+  }
+
+  pi.on("session_start", async (event, ctx) => {
+    // "this session" is a per-session delta, so a different session starts over
+    if (event.reason !== "startup" && event.reason !== "reload") startBalance = undefined;
+    await syncStatus(ctx);
+  });
+
+  // Fires for /model, the model picker and restore — the only signal for
+  // switching to or away from Junie.
+  pi.on("model_select", async (event, ctx) => {
+    await syncStatus(ctx, event.model);
+  });
+
+  pi.on("turn_end", async (_event, ctx) => {
+    await syncStatus(ctx);
   });
 
   /**
-   * Show a report without putting it into the conversation.
-   *
-   * pi.sendMessage() would be simpler, but every custom message is converted
-   * into a user message for the LLM (convertToLlm in pi's core/messages) — the
-   * `display` flag only controls TUI rendering. A status dump has no business
-   * in the context window, so it goes into a dismissible overlay instead.
-   * Without a TUI (RPC/print mode) there is nothing to show it in, so the
-   * message is the fallback rather than losing the output entirely.
+   * Report text that can be replaced while the overlay is already on screen,
+   * so the balance round-trip does not have to be awaited before showing
+   * anything.
    */
-  async function showReport(ctx: ExtensionCommandContext, markdown: string) {
-    if (!ctx.hasUI) {
-      pi.sendMessage({ customType: "junie-status", content: markdown, display: true });
-      return;
-    }
+  function createLiveReport(initial: string) {
+    let markdown = initial;
+    let requestRender: (() => void) | undefined;
 
+    return {
+      get markdown() {
+        return markdown;
+      },
+      set(next: string) {
+        markdown = next;
+        requestRender?.();
+      },
+      /** Called by the overlay once — and cleared again when it closes, so a
+       *  late arriving response cannot poke a component that is already gone. */
+      bind(render: (() => void) | undefined) {
+        requestRender = render;
+      },
+    };
+  }
+
+  type LiveReport = ReturnType<typeof createLiveReport>;
+
+  /** Show a report in a dismissible overlay, outside the conversation. */
+  async function showOverlay(ctx: ExtensionCommandContext, report: LiveReport) {
     // Rendered by hand rather than with pi-tui's Markdown component: pi-tui
     // lives in pi's own nested node_modules and is not resolvable from an
     // installed extension, so importing it would break at runtime.
     await ctx.ui.custom((tui, theme, _keybindings, done) => {
+      report.bind(() => tui.requestRender());
+
       // The TUI does not clip a component to the terminal — anything too tall
       // just pushes the conversation off-screen. So the report scrolls itself.
       let offset = 0;
@@ -269,7 +334,7 @@ export default async function (pi: ExtensionAPI) {
       return {
         render(width: number) {
           const inner = Math.max(20, width - 2);
-          const body = markdown.split("\n").flatMap((raw) => renderReportLine(raw, inner, theme));
+          const body = report.markdown.split("\n").flatMap((raw) => renderReportLine(raw, inner, theme));
 
           const viewport = Math.max(5, (process.stdout.rows ?? 24) - 10);
           const maxOffset = Math.max(0, body.length - viewport);
@@ -296,102 +361,140 @@ export default async function (pi: ExtensionAPI) {
         },
       };
     });
+
+    report.bind(undefined);
+  }
+
+  /** The lines that need no network — everything the proxy already knows. */
+  function reportHeader(): string[] {
+    const diag = getProxyDiagnostics();
+    const lines = [
+      `**Junie Bridge** ${PLUGIN_VERSION} — running on port ${port}`,
+      `**HTTP Proxy:** ${diag.proxy ?? "none (direct connection)"}`,
+    ];
+    if (diag.proxy) {
+      lines.push(`**Proxy Auth:** ${diag.auth}`);
+    }
+    return lines;
+  }
+
+  async function buildReport(ctx: ExtensionCommandContext, wantsConnTest: boolean): Promise<string> {
+    try {
+      const apiKey = await ctx.modelRegistry.getApiKeyForProvider("junie");
+      const balanceHeaders: Record<string, string> = {};
+      if (apiKey) balanceHeaders["Authorization"] = `Bearer ${apiKey}`;
+
+      // The balance round-trip dominates the command's latency, so everything
+      // it doesn't depend on is fetched alongside it rather than after it.
+      const [balanceRes, modelsRes, testRes] = await Promise.all([
+        fetch(`http://localhost:${port}/junie/balance`, { headers: balanceHeaders }),
+        fetch(`http://localhost:${port}/v1/models`),
+        wantsConnTest ? fetch(`http://localhost:${port}/junie/test`) : undefined,
+      ]);
+
+      // Read the body either way — on failure it carries the reason
+      const balanceInfo = await balanceRes.json().catch(() => null);
+      const modelsInfo = modelsRes.ok ? await modelsRes.json() : null;
+      const testInfo = testRes?.ok ? await testRes.json().catch(() => null) : null;
+
+      const lines = reportHeader();
+      lines.push("");
+
+      if (balanceInfo?.balanceLeft != null) {
+        const money = makeAmountFormatter(balanceInfo.balanceUnit);
+        lines.push(`**Balance:** ${money(balanceInfo.balanceLeft)} remaining`);
+
+        // Detailed split — only present when the Grazie QuotaAPI answered
+        const quota = balanceInfo.quota;
+        if (quota?.tariff) {
+          const refill = formatDate(quota.refill?.next);
+          lines.push(
+            `- Tariff: ${money(quota.tariff.available)} of ${money(quota.tariff.maximum)}` +
+              (refill ? ` · refills ${refill}` : ""),
+          );
+        }
+        if (quota?.topUp?.maximum) {
+          lines.push(`- Top-up: ${money(quota.topUp.available)} of ${money(quota.topUp.maximum)}`);
+        }
+
+        if (startBalance != null) {
+          lines.push(`**Session usage:** −${money(startBalance - balanceInfo.balanceLeft)}`);
+        }
+
+        if (balanceInfo.licenseType) {
+          lines.push("");
+          lines.push(`**License type:** \`${balanceInfo.licenseType}\``);
+          const until = formatDate(quota?.until);
+          if (until) lines.push(`- Valid until ${until}`);
+          if (balanceInfo.licenseType === "TRIAL") {
+            lines.push(
+              "*Unexpected license type? Junie may hand out free trial credits on top of your paid subscription." +
+                " Once your free credits are spent your paid quota should display.*",
+            );
+          }
+        }
+      } else {
+        const reason = balanceInfo?.error?.message ?? "no response from the proxy";
+        lines.push(`**Balance:** unavailable — ${reason}`);
+        lines.push("*If this persists, run /login to re-authenticate.*");
+      }
+
+      if (testInfo) {
+        lines.push("");
+        lines.push("**Connectivity:**");
+        for (const [name, t] of Object.entries(testInfo.tests) as [string, any][]) {
+          const icon = t.ok ? "+" : "!";
+          lines.push(`- [${icon}] ${name}: ${t.ok ? `ok${t.status ? ` (${t.status})` : ""}` : t.error}`);
+        }
+      }
+
+      if (modelsInfo?.data) {
+        lines.push("");
+        lines.push(`**Models** (${modelsInfo.data.length}):`);
+        for (const m of modelsInfo.data) {
+          lines.push(`- ${m.id}`);
+        }
+      }
+
+      return lines.join("\n");
+    } catch (e) {
+      return [
+        ...reportHeader(),
+        "",
+        `**Error:** ${e instanceof Error ? e.message : String(e)}`,
+      ].join("\n");
+    }
   }
 
   // /junie command for debugging and status
   pi.registerCommand("junie", {
     description: "Show Junie proxy status, balance, and connectivity info",
     async handler(args, ctx) {
-      try {
-        const apiKey = await ctx.modelRegistry.getApiKeyForProvider("junie");
-        const balanceHeaders: Record<string, string> = {};
-        if (apiKey) balanceHeaders["Authorization"] = `Bearer ${apiKey}`;
+      const wantsConnTest = args?.trim() === "test" || getProxyDiagnostics().proxy != null;
+      const pending = buildReport(ctx, wantsConnTest);
 
-        // The balance round-trip dominates the command's latency, so everything
-        // it doesn't depend on is fetched alongside it rather than after it.
-        const wantsConnTest = args?.trim() === "test" || getProxyDiagnostics().proxy != null;
-        const [balanceRes, modelsRes, testRes] = await Promise.all([
-          fetch(`http://localhost:${port}/junie/balance`, { headers: balanceHeaders }),
-          fetch(`http://localhost:${port}/v1/models`),
-          wantsConnTest ? fetch(`http://localhost:${port}/junie/test`) : undefined,
-        ]);
-
-        // Read the body either way — on failure it carries the reason
-        const balanceInfo = await balanceRes.json().catch(() => null);
-        const modelsInfo = modelsRes.ok ? await modelsRes.json() : null;
-        const testInfo = testRes?.ok ? await testRes.json().catch(() => null) : null;
-
-        const diag = getProxyDiagnostics();
-
-        const lines = [
-          `**Junie Bridge** ${PLUGIN_VERSION} — running on port ${port}`,
-          `**HTTP Proxy:** ${diag.proxy ?? "none (direct connection)"}`,
-        ];
-        if (diag.proxy) {
-          lines.push(`**Proxy Auth:** ${diag.auth}`);
-        }
-        lines.push("");
-
-        if (balanceInfo?.balanceLeft != null) {
-          const money = makeAmountFormatter(balanceInfo.balanceUnit);
-          lines.push(`**Balance:** ${money(balanceInfo.balanceLeft)} remaining`);
-
-          // Detailed split — only present when the Grazie QuotaAPI answered
-          const quota = balanceInfo.quota;
-          if (quota?.tariff) {
-            const refill = formatDate(quota.refill?.next);
-            lines.push(
-              `- Tariff: ${money(quota.tariff.available)} of ${money(quota.tariff.maximum)}` +
-                (refill ? ` · refills ${refill}` : ""),
-            );
-          }
-          if (quota?.topUp?.maximum) {
-            lines.push(`- Top-up: ${money(quota.topUp.available)} of ${money(quota.topUp.maximum)}`);
-          }
-
-          if (startBalance != null) {
-            lines.push(`**Session usage:** −${money(startBalance - balanceInfo.balanceLeft)}`);
-          }
-
-          if (balanceInfo.licenseType) {
-            lines.push("");
-            lines.push(`**License type:** \`${balanceInfo.licenseType}\``);
-            const until = formatDate(quota?.until);
-            if (until) lines.push(`- Valid until ${until}`);
-            if (balanceInfo.licenseType === "TRIAL") {
-              lines.push(
-                "*Unexpected license type? Junie may hand out free trial credits on top of your paid subscription." +
-                  " Once your free credits are spent your paid quota should display.*",
-              );
-            }
-          }
-        } else {
-          const reason = balanceInfo?.error?.message ?? "no response from the proxy";
-          lines.push(`**Balance:** unavailable — ${reason}`);
-          lines.push("*If this persists, run /login to re-authenticate.*");
-        }
-
-        if (testInfo) {
-          lines.push("");
-          lines.push("**Connectivity:**");
-          for (const [name, t] of Object.entries(testInfo.tests) as [string, any][]) {
-            const icon = t.ok ? "+" : "!";
-            lines.push(`- [${icon}] ${name}: ${t.ok ? `ok${t.status ? ` (${t.status})` : ""}` : t.error}`);
-          }
-        }
-
-        if (modelsInfo?.data) {
-          lines.push("");
-          lines.push(`**Models** (${modelsInfo.data.length}):`);
-          for (const m of modelsInfo.data) {
-            lines.push(`- ${m.id}`);
-          }
-        }
-
-        await showReport(ctx, lines.join("\n"));
-      } catch (e) {
-        await showReport(ctx, `Junie proxy error: ${e instanceof Error ? e.message : String(e)}`);
+      // pi.sendMessage() would be simpler, but every custom message is converted
+      // into a user message for the LLM (convertToLlm in pi's core/messages) —
+      // the `display` flag only controls TUI rendering. A status dump has no
+      // business in the context window, so it goes into a dismissible overlay
+      // instead. Without a TUI (RPC/print mode) there is nothing to show it in,
+      // so the message is the fallback rather than losing the output entirely.
+      if (!ctx.hasUI) {
+        pi.sendMessage({ customType: "junie-status", content: await pending, display: true });
+        return;
       }
+
+      // The balance call goes upstream to Grazie and takes a second or two.
+      // Waiting for it before opening the overlay makes the command feel stuck,
+      // so the overlay opens on the local facts and fills itself in.
+      const placeholder = [...reportHeader(), "", "**Balance:** loading…"];
+      if (wantsConnTest) placeholder.push("", "**Connectivity:** loading…");
+      placeholder.push("", "**Models:** loading…");
+
+      const report = createLiveReport(placeholder.join("\n"));
+      void pending.then((markdown) => report.set(markdown));
+
+      await showOverlay(ctx, report);
     },
   });
 

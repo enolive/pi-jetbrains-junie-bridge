@@ -15,7 +15,7 @@ Once authenticated, run `/model` to select a model provided by the junie bridge.
 ## Features
 
 - **OAuth login** — browser-based JetBrains authentication with automatic token refresh
-- **Balance tracking** — session cost and remaining balance shown in Pi's status line (see footer)
+- **Balance tracking** — session cost and remaining balance shown in Pi's status line (see footer) while a Junie model is selected
   ![Screnshot showcasing balance tracking](./docs/balance_tracking.png)
 - **`/junie` command** — check proxy status, balance, and available models from within Pi
   ![Screnshot showcasing the `junie` command](./docs/junie_command.png)

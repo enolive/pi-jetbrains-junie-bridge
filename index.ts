@@ -231,13 +231,14 @@ export default async function (pi: ExtensionAPI) {
     return model?.provider === "junie";
   }
 
-  // model_select fires alongside session_start on startup, so the two would
-  // otherwise ask the backend for the same balance twice.
-  let refreshing = false;
+  // Handlers fire-and-forget syncStatus so the model picker is not blocked on
+  // Grazie. A fresh {} token per sync means only the latest run may apply;
+  // older in-flight fetches still finish but their result is dropped.
+  let statusToken: object | undefined;
 
-  async function refreshStatus(ctx: ExtensionContext) {
-    if (refreshing) return;
-    refreshing = true;
+  type BalanceSnapshot = { balanceLeft: number; balanceUnit: unknown };
+
+  async function fetchBalance(ctx: ExtensionContext): Promise<BalanceSnapshot | undefined> {
     try {
       // The proxy can reuse the auth header of the last chat request, but
       // before the first turn there is none — so resolve the key like /junie.
@@ -248,22 +249,20 @@ export default async function (pi: ExtensionAPI) {
       if (!res.ok) return;
       const { balanceLeft, balanceUnit } = await res.json();
       if (typeof balanceLeft !== "number") return;
-      startBalance ??= balanceLeft;
-      const used = startBalance - balanceLeft;
-
-      const money = makeAmountFormatter(balanceUnit);
-      const leftDisplay = money(balanceLeft);
-      const usedDisplay = money(used);
-
-      ctx.ui.setStatus(
-        "junie",
-        `Junie: ${leftDisplay} left · −${usedDisplay} this session`,
-      );
+      return { balanceLeft, balanceUnit };
     } catch {
-      // best-effort — don't spam errors for a status line
-    } finally {
-      refreshing = false;
+      return; // best-effort — don't spam errors for a status line
     }
+  }
+
+  function applyBalanceStatus(ctx: ExtensionContext, { balanceLeft, balanceUnit }: BalanceSnapshot) {
+    startBalance ??= balanceLeft;
+    const used = startBalance - balanceLeft;
+    const money = makeAmountFormatter(balanceUnit);
+    ctx.ui.setStatus(
+      "junie",
+      `Junie: ${money(balanceLeft)} left · −${money(used)} this session`,
+    );
   }
 
   /** A status set with setStatus() is sticky, so leaving Junie has to clear it. */
@@ -272,24 +271,33 @@ export default async function (pi: ExtensionAPI) {
   }
 
   async function syncStatus(ctx: ExtensionContext, model = ctx.model) {
-    if (isJunieModel(model)) await refreshStatus(ctx);
-    else clearStatus(ctx);
+    const token = {};
+    statusToken = token;
+
+    if (!isJunieModel(model)) {
+      clearStatus(ctx);
+      return;
+    }
+
+    const snap = await fetchBalance(ctx);
+    if (!snap || statusToken !== token) return;
+    applyBalanceStatus(ctx, snap);
   }
 
-  pi.on("session_start", async (event, ctx) => {
+  pi.on("session_start", (event, ctx) => {
     // "this session" is a per-session delta, so a different session starts over
     if (event.reason !== "startup" && event.reason !== "reload") startBalance = undefined;
-    await syncStatus(ctx);
+    void syncStatus(ctx);
   });
 
   // Fires for /model, the model picker and restore — the only signal for
   // switching to or away from Junie.
-  pi.on("model_select", async (event, ctx) => {
-    await syncStatus(ctx, event.model);
+  pi.on("model_select", (event, ctx) => {
+    void syncStatus(ctx, event.model);
   });
 
-  pi.on("turn_end", async (_event, ctx) => {
-    await syncStatus(ctx);
+  pi.on("turn_end", (_event, ctx) => {
+    void syncStatus(ctx);
   });
 
   /**

@@ -281,7 +281,12 @@ export default async function (pi: ExtensionAPI) {
 
     const snap = await fetchBalance(ctx);
     if (!snap || statusToken !== token) return;
-    applyBalanceStatus(ctx, snap);
+    try {
+      applyBalanceStatus(ctx, snap);
+    } catch {
+      // ctx is stale after session replacement/reload while the fetch was
+      // in flight — the new instance owns the status line now, drop it.
+    }
   }
 
   pi.on("session_start", (event, ctx) => {

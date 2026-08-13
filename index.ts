@@ -91,6 +91,13 @@ function isEscapeKey(data: string): boolean {
   return /^\x1b\[27;\d+;27~$/.test(data);
 }
 
+/** Enter, in legacy (\r or \n) and Kitty (`CSI 13 u`) encodings. */
+function isEnterKey(data: string): boolean {
+  if (data === "\r" || data === "\n") return true;
+  const csiU = data.match(/^\x1b\[(\d+)(?::\d*)*(?:;\d+(?::\d+)?)?u$/);
+  return csiU?.[1] === "13";
+}
+
 // Arrow keys with optional CSI parameters (the Kitty protocol adds modifier and
 // event fields), plus the vi-style aliases and space.
 const SCROLL_KEY_RE = /\x1b\[([\d;:]*)([AB])|([kj ])/g;
@@ -342,14 +349,14 @@ export default async function (pi: ExtensionAPI) {
 
           const rule = theme.fg("accent", "─".repeat(width));
           const hint = maxOffset > 0
-            ? ` ↑/↓ to scroll (${offset + 1}-${Math.min(offset + viewport, body.length)} of ${body.length}) · Esc to close`
-            : " Press Esc to close";
+            ? ` ↑/↓ to scroll (${offset + 1}-${Math.min(offset + viewport, body.length)} of ${body.length}) · Enter/Esc to close`
+            : " Press Enter or Esc to close";
 
           return [rule, ...body.slice(offset, offset + viewport), theme.fg("dim", hint), rule];
         },
         invalidate() {},
         handleInput(data: string) {
-          if (isEscapeKey(data)) {
+          if (isEscapeKey(data) || isEnterKey(data)) {
             done(undefined);
             return;
           }

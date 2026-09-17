@@ -91,6 +91,13 @@ function isEscapeKey(data: string): boolean {
   return /^\x1b\[27;\d+;27~$/.test(data);
 }
 
+/** Enter, in legacy (\r or \n) and Kitty (`CSI 13 u`) encodings. */
+function isEnterKey(data: string): boolean {
+  if (data === "\r" || data === "\n") return true;
+  const csiU = data.match(/^\x1b\[(\d+)(?::\d*)*(?:;\d+(?::\d+)?)?u$/);
+  return csiU?.[1] === "13";
+}
+
 // Arrow keys with optional CSI parameters (the Kitty protocol adds modifier and
 // event fields), plus the vi-style aliases and space.
 const SCROLL_KEY_RE = /\x1b\[([\d;:]*)([AB])|([kj ])/g;
@@ -231,13 +238,14 @@ export default async function (pi: ExtensionAPI) {
     return model?.provider === "junie";
   }
 
-  // model_select fires alongside session_start on startup, so the two would
-  // otherwise ask the backend for the same balance twice.
-  let refreshing = false;
+  // Handlers fire-and-forget syncStatus so the model picker is not blocked on
+  // Grazie. A fresh {} token per sync means only the latest run may apply;
+  // older in-flight fetches still finish but their result is dropped.
+  let statusToken: object | undefined;
 
-  async function refreshStatus(ctx: ExtensionContext) {
-    if (refreshing) return;
-    refreshing = true;
+  type BalanceSnapshot = { balanceLeft: number; balanceUnit: unknown };
+
+  async function fetchBalance(ctx: ExtensionContext): Promise<BalanceSnapshot | undefined> {
     try {
       // The proxy can reuse the auth header of the last chat request, but
       // before the first turn there is none — so resolve the key like /junie.
@@ -248,22 +256,20 @@ export default async function (pi: ExtensionAPI) {
       if (!res.ok) return;
       const { balanceLeft, balanceUnit } = await res.json();
       if (typeof balanceLeft !== "number") return;
-      startBalance ??= balanceLeft;
-      const used = startBalance - balanceLeft;
-
-      const money = makeAmountFormatter(balanceUnit);
-      const leftDisplay = money(balanceLeft);
-      const usedDisplay = money(used);
-
-      ctx.ui.setStatus(
-        "junie",
-        `Junie: ${leftDisplay} left · −${usedDisplay} this session`,
-      );
+      return { balanceLeft, balanceUnit };
     } catch {
-      // best-effort — don't spam errors for a status line
-    } finally {
-      refreshing = false;
+      return; // best-effort — don't spam errors for a status line
     }
+  }
+
+  function applyBalanceStatus(ctx: ExtensionContext, { balanceLeft, balanceUnit }: BalanceSnapshot) {
+    startBalance ??= balanceLeft;
+    const used = startBalance - balanceLeft;
+    const money = makeAmountFormatter(balanceUnit);
+    ctx.ui.setStatus(
+      "junie",
+      `Junie: ${money(balanceLeft)} left · −${money(used)} this session`,
+    );
   }
 
   /** A status set with setStatus() is sticky, so leaving Junie has to clear it. */
@@ -272,24 +278,38 @@ export default async function (pi: ExtensionAPI) {
   }
 
   async function syncStatus(ctx: ExtensionContext, model = ctx.model) {
-    if (isJunieModel(model)) await refreshStatus(ctx);
-    else clearStatus(ctx);
+    const token = {};
+    statusToken = token;
+
+    if (!isJunieModel(model)) {
+      clearStatus(ctx);
+      return;
+    }
+
+    const snap = await fetchBalance(ctx);
+    if (!snap || statusToken !== token) return;
+    try {
+      applyBalanceStatus(ctx, snap);
+    } catch {
+      // ctx is stale after session replacement/reload while the fetch was
+      // in flight — the new instance owns the status line now, drop it.
+    }
   }
 
-  pi.on("session_start", async (event, ctx) => {
+  pi.on("session_start", (event, ctx) => {
     // "this session" is a per-session delta, so a different session starts over
     if (event.reason !== "startup" && event.reason !== "reload") startBalance = undefined;
-    await syncStatus(ctx);
+    void syncStatus(ctx);
   });
 
   // Fires for /model, the model picker and restore — the only signal for
   // switching to or away from Junie.
-  pi.on("model_select", async (event, ctx) => {
-    await syncStatus(ctx, event.model);
+  pi.on("model_select", (event, ctx) => {
+    void syncStatus(ctx, event.model);
   });
 
-  pi.on("turn_end", async (_event, ctx) => {
-    await syncStatus(ctx);
+  pi.on("turn_end", (_event, ctx) => {
+    void syncStatus(ctx);
   });
 
   /**
@@ -342,14 +362,14 @@ export default async function (pi: ExtensionAPI) {
 
           const rule = theme.fg("accent", "─".repeat(width));
           const hint = maxOffset > 0
-            ? ` ↑/↓ to scroll (${offset + 1}-${Math.min(offset + viewport, body.length)} of ${body.length}) · Esc to close`
-            : " Press Esc to close";
+            ? ` ↑/↓ to scroll (${offset + 1}-${Math.min(offset + viewport, body.length)} of ${body.length}) · Enter/Esc to close`
+            : " Press Enter or Esc to close";
 
           return [rule, ...body.slice(offset, offset + viewport), theme.fg("dim", hint), rule];
         },
         invalidate() {},
         handleInput(data: string) {
-          if (isEscapeKey(data)) {
+          if (isEscapeKey(data) || isEnterKey(data)) {
             done(undefined);
             return;
           }
